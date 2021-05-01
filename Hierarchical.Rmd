@@ -1,0 +1,258 @@
+---
+title: "Hierarchical"
+author: "Melique Daley"
+date: "14/04/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, include=FALSE}
+x <- c("tidyquant", "PerformanceAnalytics", "timetk", "tidyr", "cluster",
+       "factoextra", "ggplot2", "tidyverse", "bsts")
+x <- lapply(x, require, character.only = TRUE)
+```
+
+```{r}
+log_ret_monthly_xts <- read.csv("log_ret_monthly_xts.csv")
+log_ret_monthly_xts <- subset(log_ret_monthly_xts, select = -c(X.1))
+log_ret_monthly_xts$Date <- as.Date(log_ret_monthly_xts$Date , "%Y-%m-%d")
+log_ret_monthly_xts <- tk_xts(log_ret_monthly_xts)
+
+log_ret_monthly_sp500_xts <- read.csv("log_ret_monthly_sp500_xts.csv")
+log_ret_monthly_sp500_xts <- subset(log_ret_monthly_sp500_xts, select = -c(X))
+log_ret_monthly_sp500_xts$Date <- as.Date(log_ret_monthly_sp500_xts$Date , "%Y-%m-%d")
+log_ret_monthly_sp500_xts <- tk_xts(log_ret_monthly_sp500_xts)
+```
+
+```{r}
+df <- log_ret_monthly_xts
+mean_ret <- colMeans(df)
+cov_mat <- cov(df) * 21 
+```
+
+```{r}
+df.T <- t(df)
+pearson <- get_dist(df.T, method = "pearson")
+
+m <- c( "average", "single", "complete", "ward")
+
+ac <- function(x) {
+  agnes(df.T, method = x)$ac
+}
+
+results <- sapply(m, ac)
+names(results) <- c( "average", "single", "complete", "ward")
+results
+```
+
+```{r}
+fviz_nbclust(df.T, FUN = hcut, method = "wss")
+fviz_nbclust(df.T, FUN = hcut, method = "silhouette")
+```
+```{r}
+ward <- hclust(pearson, method = "ward.D2" )
+ward_cluster <- cutree(ward, k = 5)
+
+complete <- hclust(pearson, method = "complete" )
+complete_cluster <- cutree(ward, k = 5)
+
+fviz_cluster(list(data = df.T, cluster = ward_cluster))
+```
+
+```{r message=FALSE, warning=FALSE}
+
+get_members <- function(clusters, x){
+  names(clusters[clusters == x])
+}
+
+clsuter_rank <- function(df, clusters, rf){
+  cluster_nums <- seq(1, length(unique(clusters)))
+  temp <- cluster_nums
+  
+  for (i in cluster_nums){
+    members <- get_members(clusters, i)
+    ratios <- SharpeRatio(df[, members], rf=rf)[1,]
+    temp[i] <- mean(ratios)
+  }
+  
+  temp2 <- sort(temp, decreasing = TRUE)
+  rank <- sapply(temp2, match, table = temp)
+  return(rank)
+}
+
+SharpeRatio_finder <- function(df, clusters, x, rf, n) {
+  members <- get_members(clusters, x)
+  ratios <- SharpeRatio(df[, members], rf=rf)[1,]
+  names(ratios[order(ratios, decreasing=TRUE)[1:n]])
+}
+
+get_stocks <- function(n, df, clusters, rf){
+  c <- length(unique(clusters))
+  dist <- ceiling(GeometricSequence(c,n))[-1]
+  dist[1] <- dist[1]-1
+  index <- floor(runif(1, min = 2, max=length(dist)))
+  dist[index] = dist[index] + 1
+  
+  dist <- c(40, 30, 20, 10)/100
+  dist <- round(n*dist)
+  stocks <- vector(mode = "list", length = length(dist))
+  
+  ranks <- clsuter_rank(df, clusters, rf)
+  
+  for(i in dist){
+    stocks[[i]] <- SharpeRatio_finder(df, clusters, ranks[i], rf, dist[i])
+
+  }
+  
+  return(unlist(stocks))
+}
+
+port <- get_stocks(8, df, ward_cluster, 0.01)
+```
+
+
+```{r}
+profile[port,]
+```
+
+```{r}
+df_sp500_port <- merge(df[,port], log_ret_monthly_sp500_xts)
+chart.CumReturns(df_sp500_port,wealth.index=TRUE, main="Growth of $1", legend.loc="topleft")
+```
+
+```{r warning=FALSE}
+set.seed("314159")
+generate_portfolios <- function(num_port, port, rf){
+
+  all_wts <- matrix(nrow = num_port, ncol = length(port))
+  port_returns <- vector('numeric', length = num_port)
+  port_risk <- vector('numeric', length = num_port)
+  sharpe_ratio <- vector('numeric', length = num_port)
+  
+  x <- seq_along(port_returns)
+  for (i in x) {
+    
+    wts <- runif(length(port))
+    wts <- wts/sum(wts)
+    
+    # Storing weight in the matrix
+    all_wts[i,] <- wts
+    
+    # Portfolio returns
+    
+    port_ret <- sum(wts * mean_ret[port])
+    port_ret <- ((port_ret + 1)^21) - 1
+    
+    # Storing Portfolio Returns values
+    port_returns[i] <- port_ret
+    
+    
+    # Creating and storing portfolio risk
+    port_sd <- sqrt(t(wts) %*% (cov_mat[port,port]  %*% wts))
+    port_risk[i] <- port_sd
+    
+    # Creating and storing Portfolio Sharpe Ratios
+    
+    sr <- (port_ret-rf)/port_sd
+    sharpe_ratio[i] <- sr
+  }
+  portfolio_values <- tibble(Return = port_returns, Risk = port_risk, SharpeRatio = sharpe_ratio)
+  all_wts <- tk_tbl(all_wts)
+  colnames(all_wts) <- port
+  portfolio_values <- tk_tbl(cbind(all_wts, portfolio_values))
+  return(portfolio_values)
+}
+
+portfolios <- generate_portfolios(5000, port, 0.01)
+head(portfolios)
+```
+
+The minimum variance is given by
+```{r}
+min_var <- portfolios[which.min(portfolios$Risk),]
+min_var
+```
+
+The highest sharpe ratio is given by
+```{r}
+max_sr <- portfolios[which.max(portfolios$SharpeRatio),]
+max_sr
+```
+
+The following graph shows the weight distribution  for port
+```{r}
+p <- min_var %>%
+  gather(all_of(port), key = Asset,
+         value = Weights) %>%
+  mutate(Asset = as.factor(Asset)) %>%
+  ggplot(aes(x = fct_reorder(Asset,Weights), y = Weights, fill = Asset)) +
+  geom_bar(stat = 'identity') +
+  theme_minimal() +
+  labs(x = 'Assets', y = 'Weights', title = "Minimum Variance Portfolio Weights") +
+  scale_y_continuous(labels = scales::percent) 
+p
+```
+
+The Tangency Portfolio is the optimal portfolio of risky assets
+```{r}
+p <- max_sr %>%
+  gather(all_of(port), key = Asset,
+         value = Weights) %>%
+  mutate(Asset = as.factor(Asset)) %>%
+  ggplot(aes(x = fct_reorder(Asset,Weights), y = Weights, fill = Asset)) +
+  geom_bar(stat = 'identity') +
+  theme_minimal() +
+  labs(x = 'Assets', y = 'Weights', title = "Tangency Portfolio Weights") +
+  scale_y_continuous(labels = scales::percent) 
+p
+```
+
+The following plot shows all Portfolios that your generated 
+```{r}
+p <- portfolios %>%
+  ggplot(aes(x = Risk, y = Return, color = SharpeRatio)) +
+  geom_point() +
+  theme_classic() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(x = 'Annualized Risk',
+       y = 'Annualized Returns',
+       title = "Portfolio Optimization & Efficient Frontier") +
+  geom_point(aes(x = Risk,
+                 y = Return), data = min_var, color = 'green') +
+  geom_point(aes(x = Risk,
+                 y = Return), data = max_sr, color = 'red')
+p
+```
+Green is the minimum variance portfolio and red is tangency portfolio
+
+```{r}
+df_sp500_tang_port <- df_sp500_port
+df_sp500_tang_port$BKT <- df_sp500_tang_port$BKT * as.numeric(max_sr[1])
+df_sp500_tang_port$PMO <- df_sp500_tang_port$PMO * as.numeric(max_sr[2])
+df_sp500_tang_port$PMM <- df_sp500_tang_port$PMM * as.numeric(max_sr[3])
+df_sp500_tang_port$INTU <- df_sp500_tang_port$INTU * as.numeric(max_sr[4])
+df_sp500_tang_port$WCN <- df_sp500_tang_port$WCN * as.numeric(max_sr[5])
+df_sp500_tang_port$COST <- df_sp500_tang_port$COST * as.numeric(max_sr[6])
+df_sp500_tang_port$ROL <- df_sp500_tang_port$ROL * as.numeric(max_sr[7])
+
+df_sp500_tang_port$Portfolio <- rowSums(df_sp500_tang_port[,port])
+
+df_sp500_var_min_port <- df_sp500_port
+df_sp500_var_min_port$BKT <- df_sp500_var_min_port$BKT * as.numeric(min_var[1])
+df_sp500_var_min_port$PMO <- df_sp500_var_min_port$PMO * as.numeric(min_var[2])
+df_sp500_var_min_port$PMM <- df_sp500_var_min_port$PMM * as.numeric(min_var[3])
+df_sp500_var_min_port$INTU <- df_sp500_var_min_port$INTU * as.numeric(min_var[4])
+df_sp500_var_min_port$WCN <- df_sp500_var_min_port$WCN * as.numeric(min_var[5])
+df_sp500_var_min_port$COST <- df_sp500_var_min_port$COST * as.numeric(min_var[6])
+df_sp500_var_min_port$ROL <- df_sp500_var_min_port$ROL * as.numeric(min_var[7])
+
+df_sp500_var_min_port$Portfolio <- rowSums(df_sp500_var_min_port[,port])
+
+ward_port <- merge(df_sp500_tang_port[,c("GSPC", "Portfolio")], df_sp500_var_min_port[,c("Portfolio")])
+colnames(ward_port) <- c("GSPC", "Tangency Portfolio", "Minimum Variance Portfolio")
+chart.CumReturns(ward_port,wealth.index=TRUE, main="Growth of $1", legend.loc="topleft")
+```
